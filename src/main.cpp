@@ -34,6 +34,7 @@
 #include "log.h"
 #include "netconfig.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -102,6 +103,10 @@ struct SharedState {
     /* Written by WAN thread, read by LAN threads */
     DelegatedPrefix     dp{};              /* current delegated prefix   */
     uint64_t            generation = 0;    /* incremented on every change */
+
+    /* State file for crash recovery (written by LAN threads) */
+    std::string                          state_path;
+    std::vector<netconfig::LanStateEntry> lan_entries;
 };
 
 /* ====================================================================== */
@@ -119,7 +124,7 @@ struct LanState {
 
 static void apply_lan(const LanConfig &lcfg, const Config &cfg,
                       LanState &lan, const DelegatedPrefix &dp,
-                      RAServer &ra) {
+                      RAServer &ra, SharedState &shared) {
     lan.subnet = netconfig::carve_subnet(dp.prefix, dp.prefix_len,
                                          lcfg.subnet_index, 64);
     lan.prefix_len = 64;
@@ -136,10 +141,35 @@ static void apply_lan(const LanConfig &lcfg, const Config &cfg,
 
     ra.set_prefix(lan.subnet, 64, dp.valid_lt, dp.preferred_lt);
     ra.send_ra();
+
+    /* Persist state for crash recovery */
+    {
+        std::lock_guard<std::mutex> lk(shared.mtx);
+        /* Update or insert this interface's entry */
+        bool found = false;
+        for (auto &e : shared.lan_entries) {
+            if (e.interface == lcfg.interface) {
+                e.subnet     = lan.subnet;
+                e.host_addr  = lan.host_addr;
+                e.prefix_len = lan.prefix_len;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            netconfig::LanStateEntry entry;
+            entry.interface  = lcfg.interface;
+            entry.subnet     = lan.subnet;
+            entry.host_addr  = lan.host_addr;
+            entry.prefix_len = lan.prefix_len;
+            shared.lan_entries.push_back(std::move(entry));
+        }
+        netconfig::save_state(shared.state_path, shared.lan_entries);
+    }
 }
 
 static void teardown_lan(const LanConfig &lcfg, LanState &lan,
-                         RAServer &ra) {
+                         RAServer &ra, SharedState &shared) {
     if (!lan.configured) return;
     LOG_INF("LAN[%s] tearing down", lcfg.interface.c_str());
 
@@ -147,6 +177,21 @@ static void teardown_lan(const LanConfig &lcfg, LanState &lan,
     netconfig::del_route(lan.subnet, 64, lcfg.interface);
     netconfig::del_address(lcfg.interface, lan.host_addr, 64);
     lan.configured = false;
+
+    /* Remove this interface from persisted state */
+    {
+        std::lock_guard<std::mutex> lk(shared.mtx);
+        auto &v = shared.lan_entries;
+        v.erase(std::remove_if(v.begin(), v.end(),
+                    [&](const netconfig::LanStateEntry &e) {
+                        return e.interface == lcfg.interface;
+                    }),
+                v.end());
+        if (v.empty())
+            netconfig::remove_state(shared.state_path);
+        else
+            netconfig::save_state(shared.state_path, v);
+    }
 }
 
 /* ====================================================================== */
@@ -381,9 +426,9 @@ static void lan_thread_fn(const Config &cfg, const LanConfig &lcfg,
                 if (lan.configured) {
                     LOG_INF("LAN[%s] prefix changed – reconfiguring",
                             lcfg.interface.c_str());
-                    teardown_lan(lcfg, lan, *ra);
+                    teardown_lan(lcfg, lan, *ra, shared);
                 }
-                apply_lan(lcfg, cfg, lan, dp, *ra);
+                apply_lan(lcfg, cfg, lan, dp, *ra, shared);
                 seen_gen = gen;
             } else if (dp.valid && lan.configured) {
                 /* Lifetime refresh only */
@@ -405,7 +450,7 @@ static void lan_thread_fn(const Config &cfg, const LanConfig &lcfg,
     }
 
     /* ---- Shutdown: deprecate prefix on clients ---------------------- */
-    teardown_lan(lcfg, lan, *ra);
+    teardown_lan(lcfg, lan, *ra, shared);
     LOG_INF("LAN[%s] thread exiting", lcfg.interface.c_str());
 }
 
@@ -474,6 +519,23 @@ int main(int argc, char *argv[]) {
 
     /* ---- Shared state & event fds ------------------------------------ */
     SharedState shared;
+    shared.state_path = netconfig::STATE_FILE;
+
+    /* ---- Recover from previous crash --------------------------------- */
+    {
+        auto stale = netconfig::load_state(shared.state_path);
+        for (const auto &e : stale) {
+            LOG_INF("Cleanup stale: %s  %s/%d  host %s",
+                    e.interface.c_str(),
+                    netconfig::to_string(e.subnet).c_str(),
+                    e.prefix_len,
+                    netconfig::to_string(e.host_addr).c_str());
+            netconfig::del_route(e.subnet, e.prefix_len, e.interface);
+            netconfig::del_address(e.interface, e.host_addr, e.prefix_len);
+        }
+        if (!stale.empty())
+            netconfig::remove_state(shared.state_path);
+    }
 
     /*
      * One notify + one stop eventfd per LAN thread.
@@ -535,6 +597,9 @@ int main(int argc, char *argv[]) {
     wan.join();
     for (auto &t : lan_threads)
         t.join();
+
+    /* State file should already be empty, but ensure it's gone */
+    netconfig::remove_state(shared.state_path);
 
     LOG_INF("slaacbot stopped.");
     return 0;

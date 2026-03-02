@@ -68,4 +68,27 @@ struct in6_addr make_host_addr(const struct in6_addr &prefix,
 std::string      to_string(const struct in6_addr &a);
 struct in6_addr  from_string(const std::string &s);
 
+/* ---- state file (crash recovery) -------------------------------------- */
+
+/** Persistent record of what we configured on a single LAN interface. */
+struct LanStateEntry {
+    std::string     interface;          /* e.g. "eth1" */
+    struct in6_addr subnet{};           /* /64 subnet */
+    struct in6_addr host_addr{};        /* ::1 host address */
+    int             prefix_len = 64;
+};
+
+/** Default state-file location (on tmpfs so it survives crashes but not reboots). */
+inline constexpr const char *STATE_FILE = "/run/slaacbot.state";
+
+/** Write the current LAN state entries to the state file. */
+void save_state(const std::string &path,
+                const std::vector<LanStateEntry> &entries);
+
+/** Load previously saved state entries.  Returns empty vector on any error. */
+std::vector<LanStateEntry> load_state(const std::string &path);
+
+/** Remove the state file. */
+void remove_state(const std::string &path);
+
 }  // namespace netconfig

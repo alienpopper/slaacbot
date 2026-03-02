@@ -271,4 +271,68 @@ struct in6_addr from_string(const std::string &s) {
     return a;
 }
 
+/* ===================================================================== */
+/*  State file (crash recovery)                                          */
+/* ===================================================================== */
+
+/*
+ * Format: one line per LAN interface:
+ *   <interface> <subnet> <host_addr> <prefix_len>
+ * e.g.:
+ *   eth1 2001:db8:1:1:: 2001:db8:1:1::1 64
+ */
+
+void save_state(const std::string &path,
+                const std::vector<LanStateEntry> &entries) {
+    std::string tmp = path + ".tmp";
+    FILE *f = fopen(tmp.c_str(), "w");
+    if (!f) {
+        LOG_WRN("Cannot write state file %s: %s", tmp.c_str(), strerror(errno));
+        return;
+    }
+    for (const auto &e : entries) {
+        fprintf(f, "%s %s %s %d\n",
+                e.interface.c_str(),
+                to_string(e.subnet).c_str(),
+                to_string(e.host_addr).c_str(),
+                e.prefix_len);
+    }
+    fclose(f);
+    if (rename(tmp.c_str(), path.c_str()) != 0)
+        LOG_WRN("rename %s -> %s: %s", tmp.c_str(), path.c_str(), strerror(errno));
+    else
+        LOG_DBG("State saved (%zu entries)", entries.size());
+}
+
+std::vector<LanStateEntry> load_state(const std::string &path) {
+    std::vector<LanStateEntry> entries;
+    FILE *f = fopen(path.c_str(), "r");
+    if (!f) return entries;   /* no previous state */
+
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        char iface[64], subnet[INET6_ADDRSTRLEN], host[INET6_ADDRSTRLEN];
+        int plen = 0;
+        if (sscanf(line, "%63s %45s %45s %d", iface, subnet, host, &plen) == 4) {
+            LanStateEntry e;
+            e.interface  = iface;
+            e.prefix_len = plen;
+            if (inet_pton(AF_INET6, subnet, &e.subnet) == 1 &&
+                inet_pton(AF_INET6, host,   &e.host_addr) == 1) {
+                entries.push_back(std::move(e));
+            } else {
+                LOG_WRN("State file: bad address in line: %s", line);
+            }
+        }
+    }
+    fclose(f);
+    LOG_INF("Loaded %zu stale state entries from %s", entries.size(), path.c_str());
+    return entries;
+}
+
+void remove_state(const std::string &path) {
+    if (unlink(path.c_str()) == 0)
+        LOG_DBG("Removed state file %s", path.c_str());
+}
+
 }  // namespace netconfig
