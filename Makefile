@@ -1,6 +1,6 @@
 CXX      := g++
 CXXFLAGS := -std=c++17 -Wall -Wextra -Wpedantic -O2
-LDFLAGS  :=
+LDFLAGS  := -pthread
 
 SRCDIR   := src
 SOURCES  := $(wildcard $(SRCDIR)/*.cpp)
