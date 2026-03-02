@@ -1,0 +1,25 @@
+CXX      := g++
+CXXFLAGS := -std=c++17 -Wall -Wextra -Wpedantic -O2
+LDFLAGS  :=
+
+SRCDIR   := src
+SOURCES  := $(wildcard $(SRCDIR)/*.cpp)
+OBJECTS  := $(SOURCES:.cpp=.o)
+TARGET   := slaacbot
+
+.PHONY: all clean install
+
+all: $(TARGET)
+
+$(TARGET): $(OBJECTS)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+
+$(SRCDIR)/%.o: $(SRCDIR)/%.cpp
+	$(CXX) $(CXXFLAGS) -c -o $@ $<
+
+clean:
+	rm -f $(OBJECTS) $(TARGET)
+
+install: $(TARGET)
+	install -m 755 $(TARGET) /usr/local/sbin/$(TARGET)
+	@echo "Copy config.ini to /etc/slaacbot.conf and edit as needed."
