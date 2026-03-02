@@ -29,8 +29,6 @@ struct Config {
     /* Router Advertisements (shared by all LAN interfaces) */
     int         ra_interval      = 30;   /* Seconds between unsolicited RAs */
     int         router_lifetime  = 1800;
-    int         valid_lifetime   = 86400;
-    int         preferred_lifetime = 14400;
     int         mtu              = 0;    /* 0 = omit MTU option */
     int         hop_limit        = 64;
 };

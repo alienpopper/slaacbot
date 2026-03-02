@@ -83,8 +83,6 @@ Config load_config(const std::string &path) {
         } else if (section == "ra") {
             if (key == "interval")            cfg.ra_interval = std::stoi(val);
             else if (key == "router_lifetime") cfg.router_lifetime = std::stoi(val);
-            else if (key == "valid_lifetime")  cfg.valid_lifetime = std::stoi(val);
-            else if (key == "preferred_lifetime") cfg.preferred_lifetime = std::stoi(val);
             else if (key == "mtu")            cfg.mtu = std::stoi(val);
             else if (key == "hop_limit")      cfg.hop_limit = std::stoi(val);
         }
