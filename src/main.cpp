@@ -1,5 +1,5 @@
 /*
- * main.cpp - slaacbot daemon entry point (threaded).
+ * main.cpp - slaacbot daemon entry point (threaded, multi-LAN).
  *
  * Architecture:
  *
@@ -7,17 +7,20 @@
  *                 Solicit/Request exchange, T1 Renew, T2 Rebind, and
  *                 incoming Reply processing.  When the delegated prefix
  *                 changes (or is first obtained), it updates SharedState
- *                 under the mutex and signals the LAN thread via eventfd.
+ *                 under the mutex and signals every LAN thread via their
+ *                 individual eventfds.
  *
- *   LAN thread  – Owns RAServer exclusively.  Sends periodic Router
- *                 Advertisements, responds to Router Solicitations, and
- *                 watches for prefix-change notifications via eventfd.
- *                 On notification it tears down old LAN config, applies
- *                 the new prefix, and immediately advertises it.
+ *   LAN threads – One per downstream interface.  Each owns its own
+ *                 RAServer.  Sends periodic Router Advertisements,
+ *                 responds to Router Solicitations, and watches for
+ *                 prefix-change notifications via its eventfd.
+ *                 On notification it tears down old LAN config, carves
+ *                 its assigned /64, applies the new prefix, and
+ *                 immediately advertises it.
  *
- *   Main thread – Parses config, prepares interfaces, launches both
+ *   Main thread – Parses config, prepares interfaces, launches all
  *                 threads, waits for SIGINT/SIGTERM, then signals
- *                 shutdown and joins both threads.
+ *                 shutdown and joins every thread.
  *
  * Thread safety:
  *   - SharedState is protected by a std::mutex.
@@ -44,6 +47,7 @@
 #include <sys/eventfd.h>
 #include <thread>
 #include <unistd.h>
+#include <vector>
 
 /* ====================================================================== */
 /*  Globals                                                               */
@@ -89,19 +93,19 @@ private:
 };
 
 /* ====================================================================== */
-/*  Shared state between WAN and LAN threads                              */
+/*  Shared state between WAN thread and all LAN threads                   */
 /* ====================================================================== */
 
 struct SharedState {
     std::mutex          mtx;
 
-    /* Written by WAN thread, read by LAN thread */
+    /* Written by WAN thread, read by LAN threads */
     DelegatedPrefix     dp{};              /* current delegated prefix   */
     uint64_t            generation = 0;    /* incremented on every change */
 };
 
 /* ====================================================================== */
-/*  LAN state (owned exclusively by LAN thread)                           */
+/*  LAN state (owned exclusively by one LAN thread)                       */
 /* ====================================================================== */
 
 struct LanState {
@@ -113,32 +117,35 @@ struct LanState {
 
 /* ---- Apply / tear down LAN configuration ----------------------------- */
 
-static void apply_lan(const Config &cfg, LanState &lan,
-                      const DelegatedPrefix &dp, RAServer &ra) {
+static void apply_lan(const LanConfig &lcfg, const Config &cfg,
+                      LanState &lan, const DelegatedPrefix &dp,
+                      RAServer &ra) {
     lan.subnet = netconfig::carve_subnet(dp.prefix, dp.prefix_len,
-                                         cfg.subnet_index, 64);
+                                         lcfg.subnet_index, 64);
     lan.prefix_len = 64;
     lan.host_addr  = netconfig::make_host_addr(lan.subnet, 64, 1);
 
-    LOG_INF("LAN config: %s/64  host %s",
+    LOG_INF("LAN[%s] config: %s/64  host %s",
+            lcfg.interface.c_str(),
             netconfig::to_string(lan.subnet).c_str(),
             netconfig::to_string(lan.host_addr).c_str());
 
-    netconfig::add_address(cfg.lan_interface, lan.host_addr, 64);
-    netconfig::add_route(lan.subnet, 64, cfg.lan_interface);
+    netconfig::add_address(lcfg.interface, lan.host_addr, 64);
+    netconfig::add_route(lan.subnet, 64, lcfg.interface);
     lan.configured = true;
 
     ra.set_prefix(lan.subnet, 64, dp.valid_lt, dp.preferred_lt);
     ra.send_ra();
 }
 
-static void teardown_lan(const Config &cfg, LanState &lan, RAServer &ra) {
+static void teardown_lan(const LanConfig &lcfg, LanState &lan,
+                         RAServer &ra) {
     if (!lan.configured) return;
-    LOG_INF("Tearing down LAN configuration");
+    LOG_INF("LAN[%s] tearing down", lcfg.interface.c_str());
 
     ra.send_deprecation(lan.subnet, 64);
-    netconfig::del_route(lan.subnet, 64, cfg.lan_interface);
-    netconfig::del_address(cfg.lan_interface, lan.host_addr, 64);
+    netconfig::del_route(lan.subnet, 64, lcfg.interface);
+    netconfig::del_address(lcfg.interface, lan.host_addr, 64);
     lan.configured = false;
 }
 
@@ -147,8 +154,14 @@ static void teardown_lan(const Config &cfg, LanState &lan, RAServer &ra) {
 /* ====================================================================== */
 
 static void wan_thread_fn(const Config &cfg, SharedState &shared,
-                          EventFD &lan_notify, EventFD &stop_event) {
+                          std::vector<EventFD*> &lan_notifiers,
+                          EventFD &stop_event) {
     LOG_INF("WAN thread started on %s", cfg.wan_interface.c_str());
+
+    auto notify_all_lans = [&]() {
+        for (auto *ev : lan_notifiers)
+            ev->signal();
+    };
 
     /* ---- Create DHCPv6 client --------------------------------------- */
     uint8_t wan_mac[6];
@@ -157,7 +170,7 @@ static void wan_thread_fn(const Config &cfg, SharedState &shared,
     } catch (const std::exception &e) {
         LOG_ERR("WAN: %s", e.what());
         g_running.store(false);
-        lan_notify.signal();
+        notify_all_lans();
         return;
     }
 
@@ -169,14 +182,13 @@ static void wan_thread_fn(const Config &cfg, SharedState &shared,
     } catch (const std::exception &e) {
         LOG_ERR("WAN DHCPv6 init: %s", e.what());
         g_running.store(false);
-        lan_notify.signal();
+        notify_all_lans();
         return;
     }
 
     /* ---- Obtain initial prefix -------------------------------------- */
     while (g_running.load() && !dhcp->obtain_prefix()) {
         LOG_WRN("DHCPv6: retrying in %d seconds …", cfg.retransmit_timeout);
-        /* Sleep interruptibly via poll on stop_event */
         struct pollfd pfd{};
         pfd.fd     = stop_event.fd();
         pfd.events = POLLIN;
@@ -191,7 +203,7 @@ static void wan_thread_fn(const Config &cfg, SharedState &shared,
         shared.dp = dhcp->prefix();
         shared.generation++;
     }
-    lan_notify.signal();
+    notify_all_lans();
 
     /* ---- Compute renewal timers ------------------------------------- */
     using clock = std::chrono::steady_clock;
@@ -263,7 +275,7 @@ static void wan_thread_fn(const Config &cfg, SharedState &shared,
                 }
                 if (changed || new_dp.valid_lt != old_dp.valid_lt ||
                     new_dp.preferred_lt != old_dp.preferred_lt) {
-                    lan_notify.signal();
+                    notify_all_lans();
                 }
 
                 /* Reset renewal timers */
@@ -296,19 +308,22 @@ static void wan_thread_fn(const Config &cfg, SharedState &shared,
 }
 
 /* ====================================================================== */
-/*  LAN thread                                                            */
+/*  LAN thread (one per downstream interface)                             */
 /* ====================================================================== */
 
-static void lan_thread_fn(const Config &cfg, SharedState &shared,
+static void lan_thread_fn(const Config &cfg, const LanConfig &lcfg,
+                          SharedState &shared,
                           EventFD &lan_notify, EventFD &stop_event) {
-    LOG_INF("LAN thread started on %s", cfg.lan_interface.c_str());
+    LOG_INF("LAN thread started on %s (subnet_index=%d)",
+            lcfg.interface.c_str(), lcfg.subnet_index);
 
     /* ---- Create RA server ------------------------------------------- */
     std::unique_ptr<RAServer> ra;
     try {
-        ra = std::make_unique<RAServer>(cfg.lan_interface, cfg);
+        ra = std::make_unique<RAServer>(lcfg.interface, cfg);
     } catch (const std::exception &e) {
-        LOG_ERR("LAN RA init: %s", e.what());
+        LOG_ERR("LAN[%s] RA init: %s",
+                lcfg.interface.c_str(), e.what());
         g_running.store(false);
         return;
     }
@@ -337,7 +352,8 @@ static void lan_thread_fn(const Config &cfg, SharedState &shared,
 
         int ret = poll(fds, 3, static_cast<int>(wait_ms));
         if (ret < 0 && errno != EINTR) {
-            LOG_ERR("LAN poll: %s", strerror(errno));
+            LOG_ERR("LAN[%s] poll: %s",
+                    lcfg.interface.c_str(), strerror(errno));
             break;
         }
 
@@ -363,10 +379,11 @@ static void lan_thread_fn(const Config &cfg, SharedState &shared,
 
             if (gen != seen_gen && dp.valid) {
                 if (lan.configured) {
-                    LOG_INF("Prefix changed – reconfiguring LAN");
-                    teardown_lan(cfg, lan, *ra);
+                    LOG_INF("LAN[%s] prefix changed – reconfiguring",
+                            lcfg.interface.c_str());
+                    teardown_lan(lcfg, lan, *ra);
                 }
-                apply_lan(cfg, lan, dp, *ra);
+                apply_lan(lcfg, cfg, lan, dp, *ra);
                 seen_gen = gen;
             } else if (dp.valid && lan.configured) {
                 /* Lifetime refresh only */
@@ -388,8 +405,8 @@ static void lan_thread_fn(const Config &cfg, SharedState &shared,
     }
 
     /* ---- Shutdown: deprecate prefix on clients ---------------------- */
-    teardown_lan(cfg, lan, *ra);
-    LOG_INF("LAN thread exiting");
+    teardown_lan(lcfg, lan, *ra);
+    LOG_INF("LAN[%s] thread exiting", lcfg.interface.c_str());
 }
 
 /* ====================================================================== */
@@ -448,7 +465,8 @@ int main(int argc, char *argv[]) {
     try {
         netconfig::enable_forwarding();
         netconfig::set_accept_ra(cfg.wan_interface, 2);
-        netconfig::set_accept_ra(cfg.lan_interface, 0);
+        for (const auto &lcfg : cfg.lans)
+            netconfig::set_accept_ra(lcfg.interface, 0);
     } catch (const std::exception &e) {
         LOG_ERR("Interface setup: %s", e.what());
         return 1;
@@ -456,18 +474,42 @@ int main(int argc, char *argv[]) {
 
     /* ---- Shared state & event fds ------------------------------------ */
     SharedState shared;
-    EventFD     lan_notify;      /* WAN → LAN: "prefix updated"         */
-    EventFD     wan_stop;        /* main → WAN: "time to stop"          */
-    EventFD     lan_stop;        /* main → LAN: "time to stop"          */
 
-    /* ---- Launch threads ---------------------------------------------- */
+    /*
+     * One notify + one stop eventfd per LAN thread.
+     * We use unique_ptr because EventFD is non-copyable/non-movable.
+     */
+    size_t num_lans = cfg.lans.size();
+
+    std::vector<std::unique_ptr<EventFD>> lan_notifiers;
+    std::vector<std::unique_ptr<EventFD>> lan_stops;
+    for (size_t i = 0; i < num_lans; ++i) {
+        lan_notifiers.push_back(std::make_unique<EventFD>());
+        lan_stops.push_back(std::make_unique<EventFD>());
+    }
+
+    /* Build a raw-pointer vector for the WAN thread to iterate over. */
+    std::vector<EventFD*> notifier_ptrs;
+    for (auto &p : lan_notifiers)
+        notifier_ptrs.push_back(p.get());
+
+    EventFD wan_stop;
+
+    /* ---- Launch WAN thread ------------------------------------------- */
     std::thread wan(wan_thread_fn,
                     std::cref(cfg), std::ref(shared),
-                    std::ref(lan_notify), std::ref(wan_stop));
+                    std::ref(notifier_ptrs), std::ref(wan_stop));
 
-    std::thread lan(lan_thread_fn,
-                    std::cref(cfg), std::ref(shared),
-                    std::ref(lan_notify), std::ref(lan_stop));
+    /* ---- Launch LAN threads ----------------------------------------- */
+    std::vector<std::thread> lan_threads;
+    for (size_t i = 0; i < num_lans; ++i) {
+        lan_threads.emplace_back(lan_thread_fn,
+                                 std::cref(cfg),
+                                 std::cref(cfg.lans[i]),
+                                 std::ref(shared),
+                                 std::ref(*lan_notifiers[i]),
+                                 std::ref(*lan_stops[i]));
+    }
 
     /* ---- Signal handling (main thread only) -------------------------- */
     struct sigaction sa{};
@@ -476,21 +518,23 @@ int main(int argc, char *argv[]) {
     sigaction(SIGINT,  &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
 
-    LOG_INF("slaacbot running  (WAN=%s  LAN=%s)",
-            cfg.wan_interface.c_str(), cfg.lan_interface.c_str());
+    LOG_INF("slaacbot running  (WAN=%s  %zu LAN interface(s))",
+            cfg.wan_interface.c_str(), num_lans);
 
     /* Block until a signal sets g_running = false */
     while (g_running.load()) {
         pause();   /* sleep until any signal */
     }
 
-    /* ---- Shutdown: signal both threads ------------------------------- */
+    /* ---- Shutdown: signal all threads -------------------------------- */
     LOG_INF("Shutting down …");
     wan_stop.signal();
-    lan_stop.signal();
+    for (auto &s : lan_stops)
+        s->signal();
 
     wan.join();
-    lan.join();
+    for (auto &t : lan_threads)
+        t.join();
 
     LOG_INF("slaacbot stopped.");
     return 0;

@@ -5,14 +5,20 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
+
+/* Per-LAN-interface configuration. */
+struct LanConfig {
+    std::string interface;               /* e.g. "eth1" */
+    int         subnet_index = 0;        /* Which /64 inside the delegated prefix */
+};
 
 struct Config {
     /* WAN (upstream / ISP-facing) */
     std::string wan_interface;
 
-    /* LAN (downstream / client-facing) */
-    std::string lan_interface;
-    int         subnet_index     = 0;    /* Which /64 inside the delegated prefix */
+    /* LAN (downstream / client-facing) – one or more */
+    std::vector<LanConfig> lans;
 
     /* DHCPv6-PD */
     int         prefix_length    = 56;   /* Requested prefix length */
@@ -20,7 +26,7 @@ struct Config {
     int         retransmit_timeout = 5;  /* Seconds */
     int         max_retransmit   = 10;
 
-    /* Router Advertisements */
+    /* Router Advertisements (shared by all LAN interfaces) */
     int         ra_interval      = 30;   /* Seconds between unsolicited RAs */
     int         router_lifetime  = 1800;
     int         valid_lifetime   = 86400;
