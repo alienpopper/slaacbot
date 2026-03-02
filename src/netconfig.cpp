@@ -25,7 +25,7 @@ int run_cmd(const std::vector<std::string> &args, std::string *output) {
     /* Build a debug string */
     std::string dbg;
     for (auto &a : args) { dbg += a; dbg += ' '; }
-    LOG_DBG("exec: %s", dbg.c_str());
+    LOG_INF("exec: %s", dbg.c_str());
 
     int pipefd[2] = {-1, -1};
     if (output) {
