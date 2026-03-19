@@ -126,6 +126,7 @@ struct LanState {
 static void apply_lan(const LanConfig &lcfg, const Config &cfg,
                       LanState &lan, const DelegatedPrefix &dp,
                       RAServer &ra, SharedState &shared) {
+    (void)cfg; /* unused in current implementation */
     lan.subnet = netconfig::carve_subnet(dp.prefix, dp.prefix_len,
                                          lcfg.subnet_index, 64);
     lan.prefix_len = 64;
