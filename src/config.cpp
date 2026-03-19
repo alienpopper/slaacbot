@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <fstream>
+#include <net/if.h>
+#include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -17,6 +19,12 @@ static std::string trim(const std::string &s) {
     if (b == std::string::npos) return {};
     auto e = s.find_last_not_of(" \t\r\n");
     return s.substr(b, e - b + 1);
+}
+
+static bool valid_iface_name(const std::string &name) {
+    static const std::regex re("^[a-zA-Z0-9._-]+$");
+    return !name.empty() && name.size() <= IFNAMSIZ - 1 &&
+           std::regex_match(name, re);
 }
 
 /* ---- public API ------------------------------------------------------- */
@@ -91,12 +99,51 @@ Config load_config(const std::string &path) {
     /* Validate mandatory fields */
     if (cfg.wan_interface.empty())
         throw std::runtime_error("config: wan/interface is required");
+    if (!valid_iface_name(cfg.wan_interface))
+        throw std::runtime_error(
+            "config: wan/interface contains invalid characters: "
+            + cfg.wan_interface);
     if (cfg.lans.empty())
         throw std::runtime_error("config: at least one [lan] section is required");
     for (size_t i = 0; i < cfg.lans.size(); ++i) {
         if (cfg.lans[i].interface.empty())
             throw std::runtime_error(
                 "config: lan[" + std::to_string(i) + "]/interface is required");
+        if (!valid_iface_name(cfg.lans[i].interface))
+            throw std::runtime_error(
+                "config: lan[" + std::to_string(i)
+                + "]/interface contains invalid characters: "
+                + cfg.lans[i].interface);
+    }
+
+    /* Validate numeric ranges */
+    if (cfg.prefix_length < 1 || cfg.prefix_length > 128)
+        throw std::runtime_error(
+            "config: dhcpv6/prefix_length must be 1–128");
+    if (cfg.hop_limit < 0 || cfg.hop_limit > 255)
+        throw std::runtime_error(
+            "config: ra/hop_limit must be 0–255");
+    if (cfg.ra_interval < 3)
+        throw std::runtime_error(
+            "config: ra/interval must be >= 3 (RFC 4861 minimum)");
+    if (cfg.retransmit_timeout < 1)
+        throw std::runtime_error(
+            "config: dhcpv6/retransmit_timeout must be >= 1");
+    if (cfg.max_retransmit < 1)
+        throw std::runtime_error(
+            "config: dhcpv6/max_retransmit must be >= 1");
+    if (cfg.router_lifetime < 0 || cfg.router_lifetime > 65535)
+        throw std::runtime_error(
+            "config: ra/router_lifetime must be 0–65535");
+    if (cfg.mtu < 0)
+        throw std::runtime_error(
+            "config: ra/mtu must be >= 0");
+    for (size_t i = 0; i < cfg.lans.size(); ++i) {
+        if (cfg.lans[i].subnet_index < 0 ||
+            cfg.lans[i].subnet_index > 255)
+            throw std::runtime_error(
+                "config: lan[" + std::to_string(i)
+                + "]/subnet_index must be 0–255");
     }
 
     LOG_INF("Config loaded: WAN=%s  %zu LAN interface(s)  prefix_len=/%d",

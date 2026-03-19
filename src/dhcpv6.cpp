@@ -18,6 +18,8 @@
 #include <cstring>
 #include <net/if.h>
 #include <poll.h>
+#include <stdexcept>
+#include <sys/random.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <stdexcept>
@@ -53,6 +55,8 @@ void DHCPv6Client::put_option(std::vector<uint8_t> &buf, uint16_t code,
 
 void DHCPv6Client::put_option(std::vector<uint8_t> &buf, uint16_t code,
                                const std::vector<uint8_t> &data) {
+    if (data.size() > UINT16_MAX)
+        throw std::runtime_error("DHCPv6 option data exceeds 65535 bytes");
     put_option(buf, code, data.data(), static_cast<uint16_t>(data.size()));
 }
 
@@ -133,11 +137,9 @@ void DHCPv6Client::build_duid(const uint8_t mac[6]) {
 }
 
 void DHCPv6Client::new_xid() {
-    /* 3 random bytes */
-    uint32_t r = static_cast<uint32_t>(random());
-    xid_[0] = static_cast<uint8_t>(r >> 16);
-    xid_[1] = static_cast<uint8_t>(r >> 8);
-    xid_[2] = static_cast<uint8_t>(r);
+    /* 3 cryptographically random bytes */
+    if (getrandom(xid_, sizeof(xid_), 0) != sizeof(xid_))
+        throw std::runtime_error("getrandom() failed for transaction ID");
 }
 
 /* ===================================================================== */
@@ -383,6 +385,9 @@ bool DHCPv6Client::parse_ia_pd(const uint8_t *data, size_t len) {
                 std::string msg_text(
                     reinterpret_cast<const char *>(data + pos + 2),
                     sub_len - 2);
+                /* Sanitise: replace non-printable bytes */
+                for (auto &c : msg_text)
+                    if (c < 0x20 || c > 0x7E) c = '?';
                 LOG_ERR("DHCPv6: IA_PD status %u: %s",
                         status, msg_text.c_str());
                 return false;
@@ -444,6 +449,8 @@ bool DHCPv6Client::parse_message(const uint8_t *data, size_t len,
                     std::string txt(
                         reinterpret_cast<const char *>(data + pos + 2),
                         opt_len - 2);
+                    for (auto &c : txt)
+                        if (c < 0x20 || c > 0x7E) c = '?';
                     LOG_ERR("DHCPv6: status %u: %s", st, txt.c_str());
                 }
             }
@@ -508,16 +515,18 @@ void DHCPv6Client::send_renew() {
     LOG_INF("DHCPv6: sending Renew");
     auto msg  = build_renew();
     auto dest = make_mcast_dest(if_index_);    /* could unicast, but mcast works */
-    sendto(sock_, msg.data(), msg.size(), 0,
-           reinterpret_cast<struct sockaddr *>(&dest), sizeof(dest));
+    if (sendto(sock_, msg.data(), msg.size(), 0,
+               reinterpret_cast<struct sockaddr *>(&dest), sizeof(dest)) < 0)
+        LOG_ERR("DHCPv6 Renew sendto: %s", strerror(errno));
 }
 
 void DHCPv6Client::send_rebind() {
     LOG_INF("DHCPv6: sending Rebind");
     auto msg  = build_rebind();
     auto dest = make_mcast_dest(if_index_);
-    sendto(sock_, msg.data(), msg.size(), 0,
-           reinterpret_cast<struct sockaddr *>(&dest), sizeof(dest));
+    if (sendto(sock_, msg.data(), msg.size(), 0,
+               reinterpret_cast<struct sockaddr *>(&dest), sizeof(dest)) < 0)
+        LOG_ERR("DHCPv6 Rebind sendto: %s", strerror(errno));
 }
 
 void DHCPv6Client::send_release() {
@@ -525,8 +534,9 @@ void DHCPv6Client::send_release() {
     LOG_INF("DHCPv6: sending Release");
     auto msg  = build_release();
     auto dest = make_mcast_dest(if_index_);
-    sendto(sock_, msg.data(), msg.size(), 0,
-           reinterpret_cast<struct sockaddr *>(&dest), sizeof(dest));
+    if (sendto(sock_, msg.data(), msg.size(), 0,
+               reinterpret_cast<struct sockaddr *>(&dest), sizeof(dest)) < 0)
+        LOG_ERR("DHCPv6 Release sendto: %s", strerror(errno));
 }
 
 bool DHCPv6Client::handle_reply() {
