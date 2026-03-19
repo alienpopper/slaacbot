@@ -24,6 +24,7 @@
 #include <netinet/icmp6.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <stdexcept>
 
 /* ICMPv6 types */
 static constexpr uint8_t ND_RA_TYPE = 134;
@@ -32,7 +33,7 @@ static constexpr uint8_t ND_RS_TYPE = 133;
 /* ND option types */
 static constexpr uint8_t ND_OPT_SLLA       = 1;  /* Source Link-Layer Address */
 static constexpr uint8_t ND_OPT_PREFIX     = 3;  /* Prefix Information */
-static constexpr uint8_t ND_OPT_MTU        = 5;  /* MTU */
+static constexpr uint8_t ND_OPT_MTU_TYPE   = 5;  /* MTU */
 
 /* Helper: append to vector */
 static inline void put8(std::vector<uint8_t> &v, uint8_t x) {
@@ -71,8 +72,12 @@ RAServer::RAServer(const std::string &iface, const Config &cfg)
     /* Bind to the LAN interface */
     struct ifreq ifr{};
     strncpy(ifr.ifr_name, iface_.c_str(), IFNAMSIZ - 1);
+#ifdef SO_BINDTODEVICE
     if (setsockopt(sock_, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(ifr)) < 0)
         LOG_WRN("SO_BINDTODEVICE(RA): %s", strerror(errno));
+#else
+    LOG_WRN("SO_BINDTODEVICE not available on this platform (skipped)");
+#endif
 
     /* Set hop limit to 255 (required by RFC 4861) */
     int hops = 255;
@@ -156,7 +161,7 @@ std::vector<uint8_t> RAServer::build_ra(const struct in6_addr &pfx,
 
     /* ---- Option: MTU (8 bytes, optional) ---- */
     if (mtu_ > 0) {
-        put8(pkt, ND_OPT_MTU);
+        put8(pkt, ND_OPT_MTU_TYPE);
         put8(pkt, 1);                                 /* Length (units of 8) */
         put16(pkt, 0);                                /* Reserved */
         put32(pkt, static_cast<uint32_t>(mtu_));

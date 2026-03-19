@@ -47,6 +47,7 @@
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <thread>
+#include <stdexcept>
 #include <unistd.h>
 #include <vector>
 

@@ -153,8 +153,8 @@ private:
 
     bool parse_message(const uint8_t *data, size_t len, uint8_t expected_type);
     bool parse_ia_pd(const uint8_t *data, size_t len);
-
     /* Append helpers (network byte order) */
+public:
     static void put_u16(std::vector<uint8_t> &buf, uint16_t v);
     static void put_u32(std::vector<uint8_t> &buf, uint32_t v);
     static void put_option(std::vector<uint8_t> &buf, uint16_t code,
@@ -165,4 +165,6 @@ private:
     /* Read helpers */
     static uint16_t get_u16(const uint8_t *p);
     static uint32_t get_u32(const uint8_t *p);
+
+private:
 };

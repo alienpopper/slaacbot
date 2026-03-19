@@ -20,6 +20,7 @@
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <stdexcept>
 
 /* ---- Constants -------------------------------------------------------- */
 
@@ -91,8 +92,12 @@ DHCPv6Client::DHCPv6Client(const std::string &iface, const uint8_t mac[6],
     /* Bind to the WAN interface */
     struct ifreq ifr{};
     strncpy(ifr.ifr_name, iface_.c_str(), IFNAMSIZ - 1);
+#ifdef SO_BINDTODEVICE
     if (setsockopt(sock_, SOL_SOCKET, SO_BINDTODEVICE, &ifr, sizeof(ifr)) < 0)
         LOG_WRN("SO_BINDTODEVICE failed (non-fatal): %s", strerror(errno));
+#else
+    LOG_WRN("SO_BINDTODEVICE not available on this platform (skipped)");
+#endif
 
     /* Set outgoing multicast interface */
     int idx = if_index_;
