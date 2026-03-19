@@ -89,6 +89,10 @@ RAServer::RAServer(const std::string &iface, const Config &cfg)
     ICMP6_FILTER_SETPASS(ND_RS_TYPE, &filter);
     setsockopt(sock_, IPPROTO_ICMPV6, ICMP6_FILTER, &filter, sizeof(filter));
 
+    /* Receive hop-limit ancillary data (for RFC 4861 validation) */
+    int on = 1;
+    setsockopt(sock_, IPPROTO_IPV6, IPV6_RECVHOPLIMIT, &on, sizeof(on));
+
     /* Join all-routers multicast group (ff02::2) to receive RS */
     struct ipv6_mreq mreq{};
     inet_pton(AF_INET6, "ff02::2", &mreq.ipv6mr_multiaddr);
@@ -181,6 +185,11 @@ void RAServer::send_raw(const std::vector<uint8_t> &pkt,
 void RAServer::send_ra() {
     if (prefix_len_ == 0) return; /* no prefix set yet */
 
+    /* Rate-limit: RFC 4861 §6.2.6 */
+    auto now = std::chrono::steady_clock::now();
+    if (now - last_ra_time_ < std::chrono::seconds(MIN_RA_DELAY_S))
+        return;
+
     auto pkt = build_ra(prefix_, prefix_len_, valid_lt_, preferred_lt_);
 
     /* Send to ff02::1 (all-nodes) */
@@ -190,6 +199,7 @@ void RAServer::send_ra() {
     inet_pton(AF_INET6, "ff02::1", &dest.sin6_addr);
 
     send_raw(pkt, dest);
+    last_ra_time_ = now;
     LOG_DBG("RA: sent unsolicited advertisement");
 }
 
@@ -218,19 +228,47 @@ void RAServer::send_deprecation(const struct in6_addr &old_prefix,
 bool RAServer::handle_rs() {
     uint8_t buf[1500];
     struct sockaddr_in6 src{};
-    socklen_t srclen = sizeof(src);
+    struct iovec iov{};
+    iov.iov_base = buf;
+    iov.iov_len  = sizeof(buf);
 
-    ssize_t n = recvfrom(sock_, buf, sizeof(buf), MSG_DONTWAIT,
-                         reinterpret_cast<struct sockaddr *>(&src), &srclen);
+    /* Ancillary data buffer for hop limit */
+    uint8_t cmsg_buf[CMSG_SPACE(sizeof(int))];
+
+    struct msghdr mhdr{};
+    mhdr.msg_name       = &src;
+    mhdr.msg_namelen    = sizeof(src);
+    mhdr.msg_iov        = &iov;
+    mhdr.msg_iovlen     = 1;
+    mhdr.msg_control    = cmsg_buf;
+    mhdr.msg_controllen = sizeof(cmsg_buf);
+
+    ssize_t n = recvmsg(sock_, &mhdr, MSG_DONTWAIT);
     if (n < 8) return false; /* RS is at least 8 bytes */
 
     if (buf[0] != ND_RS_TYPE || buf[1] != 0)
         return false;
 
+    /* RFC 4861 §6.1.1: hop limit must be 255 (on-link check) */
+    int hoplimit = -1;
+    for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&mhdr);
+         cmsg != nullptr;
+         cmsg = CMSG_NXTHDR(&mhdr, cmsg)) {
+        if (cmsg->cmsg_level == IPPROTO_IPV6 &&
+            cmsg->cmsg_type  == IPV6_HOPLIMIT) {
+            std::memcpy(&hoplimit, CMSG_DATA(cmsg), sizeof(hoplimit));
+            break;
+        }
+    }
+    if (hoplimit != 255) {
+        LOG_DBG("RA: discarding RS with hop limit %d (expected 255)", hoplimit);
+        return false;
+    }
+
     LOG_DBG("RA: received Router Solicitation from %s",
             netconfig::to_string(src.sin6_addr).c_str());
 
-    /* Respond with an RA to all-nodes (ff02::1) */
+    /* Respond with an RA (rate-limited by send_ra) */
     send_ra();
     return true;
 }

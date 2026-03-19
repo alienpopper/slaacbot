@@ -9,6 +9,7 @@
 
 #include "config.h"
 
+#include <chrono>
 #include <cstdint>
 #include <netinet/in.h>
 #include <string>
@@ -57,6 +58,10 @@ private:
     std::string iface_;
     int         if_index_;
     uint8_t     mac_[6]{};
+
+    /* Rate-limiting: RFC 4861 §6.2.6 minimum delay between RAs */
+    std::chrono::steady_clock::time_point last_ra_time_{};
+    static constexpr int MIN_RA_DELAY_S = 3;
 
     /* Current prefix being advertised */
     struct in6_addr prefix_{};

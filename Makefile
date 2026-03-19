@@ -1,6 +1,7 @@
 CXX      := g++
-CXXFLAGS := -std=c++17 -Wall -Wextra -Wpedantic -O2
-LDFLAGS  := -pthread
+CXXFLAGS := -std=c++17 -Wall -Wextra -Wpedantic -O2 \
+           -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE
+LDFLAGS  := -pthread -pie -Wl,-z,relro,-z,now
 
 SRCDIR   := src
 SOURCES  := $(wildcard $(SRCDIR)/*.cpp)

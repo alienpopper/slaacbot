@@ -9,9 +9,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <net/if.h>
 #include <regex>
 #include <stdexcept>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -285,9 +287,15 @@ struct in6_addr from_string(const std::string &s) {
 void save_state(const std::string &path,
                 const std::vector<LanStateEntry> &entries) {
     std::string tmp = path + ".tmp";
-    FILE *f = fopen(tmp.c_str(), "w");
-    if (!f) {
+    int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
         LOG_WRN("Cannot write state file %s: %s", tmp.c_str(), strerror(errno));
+        return;
+    }
+    FILE *f = fdopen(fd, "w");
+    if (!f) {
+        LOG_WRN("fdopen state file %s: %s", tmp.c_str(), strerror(errno));
+        close(fd);
         return;
     }
     for (const auto &e : entries) {

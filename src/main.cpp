@@ -495,9 +495,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    /* ---- Seed RNG ---------------------------------------------------- */
-    srandom(static_cast<unsigned>(time(nullptr) ^ getpid()));
-
     /* ---- Daemonise if requested -------------------------------------- */
     if (daemonise) {
         if (daemon(0, 0) < 0) {
