@@ -233,120 +233,151 @@ static void wan_thread_fn(const Config &cfg, SharedState &shared,
         return;
     }
 
-    /* ---- Obtain initial prefix -------------------------------------- */
-    while (g_running.load() && !dhcp->obtain_prefix()) {
-        LOG_WRN("DHCPv6: retrying in %d seconds …", cfg.retransmit_timeout);
-        struct pollfd pfd{};
-        pfd.fd     = stop_event.fd();
-        pfd.events = POLLIN;
-        poll(&pfd, 1, cfg.retransmit_timeout * 1000);
-        if (pfd.revents & POLLIN) { stop_event.consume(); break; }
-    }
-    if (!g_running.load()) return;
-
-    /* ---- Publish initial prefix to shared state --------------------- */
-    {
-        std::lock_guard<std::mutex> lk(shared.mtx);
-        shared.dp = dhcp->prefix();
-        shared.generation++;
-    }
-    notify_all_lans();
-
-    /* ---- Compute renewal timers ------------------------------------- */
-    using clock = std::chrono::steady_clock;
-    auto lease_start = clock::now();
-
-    auto t1_secs = dhcp->prefix().t1 > 0
-                       ? dhcp->prefix().t1
-                       : dhcp->prefix().valid_lt / 2;
-    auto t2_secs = dhcp->prefix().t2 > 0
-                       ? dhcp->prefix().t2
-                       : dhcp->prefix().valid_lt * 4 / 5;
-
-    auto renew_time  = lease_start + std::chrono::seconds(t1_secs);
-    auto rebind_time = lease_start + std::chrono::seconds(t2_secs);
-    bool renew_sent  = false;
-    bool rebind_sent = false;
-
-    LOG_INF("WAN event loop  (T1=%us  T2=%us)", t1_secs, t2_secs);
-
-    /* ---- WAN poll loop ---------------------------------------------- */
+    /* ---- WAN poll fds (fixed for the lifetime of this thread) ------- */
     struct pollfd fds[2];
     fds[0].fd     = dhcp->fd();
     fds[0].events = POLLIN;
     fds[1].fd     = stop_event.fd();
     fds[1].events = POLLIN;
 
+    using clock = std::chrono::steady_clock;
+
+    /* ---- Outer loop: re-runs after lease expiry --------------------- */
     while (g_running.load()) {
-        auto now = clock::now();
 
-        auto next_event = renew_time;
-        if (!renew_sent && renew_time < next_event)  next_event = renew_time;
-        if (!rebind_sent && rebind_time < next_event) next_event = rebind_time;
+        /* Re-apply accept_ra=2 in case systemd-networkd reset it */
+        netconfig::set_accept_ra(cfg.wan_interface, 2);
 
-        auto wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                           next_event - now).count();
-        if (wait_ms < 0) wait_ms = 0;
-        if (wait_ms > 60000) wait_ms = 60000;
-
-        int ret = poll(fds, 2, static_cast<int>(wait_ms));
-        if (ret < 0 && errno != EINTR) {
-            LOG_ERR("WAN poll: %s", strerror(errno));
-            break;
+        /* ---- Obtain initial prefix ---------------------------------- */
+        while (g_running.load() && !dhcp->obtain_prefix()) {
+            LOG_WRN("DHCPv6: retrying in %d seconds …", cfg.retransmit_timeout);
+            struct pollfd pfd{};
+            pfd.fd     = stop_event.fd();
+            pfd.events = POLLIN;
+            poll(&pfd, 1, cfg.retransmit_timeout * 1000);
+            if (pfd.revents & POLLIN) { stop_event.consume(); break; }
         }
+        if (!g_running.load()) break;
 
-        /* Stop signal? */
-        if (fds[1].revents & POLLIN) {
-            stop_event.consume();
-            break;
+        /* ---- Publish prefix to shared state ------------------------- */
+        {
+            std::lock_guard<std::mutex> lk(shared.mtx);
+            shared.dp = dhcp->prefix();
+            shared.generation++;
         }
+        notify_all_lans();
 
-        now = clock::now();
+        /* ---- Compute renewal timers --------------------------------- */
+        auto lease_start = clock::now();
 
-        /* ---- DHCPv6 reply ------------------------------------------- */
-        if (fds[0].revents & POLLIN) {
-            DelegatedPrefix old_dp = dhcp->prefix();
+        auto t1_secs = dhcp->prefix().t1 > 0
+                           ? dhcp->prefix().t1
+                           : dhcp->prefix().valid_lt / 2;
+        auto t2_secs = dhcp->prefix().t2 > 0
+                           ? dhcp->prefix().t2
+                           : dhcp->prefix().valid_lt * 4 / 5;
+        auto valid_secs = dhcp->prefix().valid_lt;
 
-            if (dhcp->handle_reply()) {
-                const auto &new_dp = dhcp->prefix();
+        auto renew_time  = lease_start + std::chrono::seconds(t1_secs);
+        auto rebind_time = lease_start + std::chrono::seconds(t2_secs);
+        auto expire_time = lease_start + std::chrono::seconds(valid_secs);
+        bool renew_sent  = false;
+        bool rebind_sent = false;
 
-                bool changed = (std::memcmp(&old_dp.prefix,
-                                            &new_dp.prefix, 16) != 0 ||
-                                old_dp.prefix_len != new_dp.prefix_len);
+        LOG_INF("WAN event loop  (T1=%us  T2=%us  valid=%us)",
+                t1_secs, t2_secs, valid_secs);
 
-                /* Publish to shared state */
+        /* ---- Inner WAN poll loop ------------------------------------ */
+        while (g_running.load()) {
+            auto now = clock::now();
+
+            /* Next scheduled event */
+            clock::time_point next_event;
+            if      (!renew_sent)  next_event = renew_time;
+            else if (!rebind_sent) next_event = rebind_time;
+            else                   next_event = expire_time;
+
+            auto wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               next_event - now).count();
+            if (wait_ms < 0)     wait_ms = 0;
+            if (wait_ms > 60000) wait_ms = 60000;
+
+            int ret = poll(fds, 2, static_cast<int>(wait_ms));
+            if (ret < 0 && errno != EINTR) {
+                LOG_ERR("WAN poll: %s", strerror(errno));
+                break;
+            }
+
+            /* Stop signal? */
+            if (fds[1].revents & POLLIN) {
+                stop_event.consume();
+                break;
+            }
+
+            now = clock::now();
+
+            /* ---- DHCPv6 reply --------------------------------------- */
+            if (fds[0].revents & POLLIN) {
+                DelegatedPrefix old_dp = dhcp->prefix();
+
+                if (dhcp->handle_reply()) {
+                    const auto &new_dp = dhcp->prefix();
+
+                    bool changed = (std::memcmp(&old_dp.prefix,
+                                                &new_dp.prefix, 16) != 0 ||
+                                    old_dp.prefix_len != new_dp.prefix_len);
+
+                    /* Publish to shared state */
+                    {
+                        std::lock_guard<std::mutex> lk(shared.mtx);
+                        shared.dp = new_dp;
+                        if (changed) shared.generation++;
+                    }
+                    if (changed || new_dp.valid_lt != old_dp.valid_lt ||
+                        new_dp.preferred_lt != old_dp.preferred_lt) {
+                        notify_all_lans();
+                    }
+
+                    /* Reset renewal timers */
+                    lease_start  = now;
+                    t1_secs      = new_dp.t1 > 0 ? new_dp.t1 : new_dp.valid_lt / 2;
+                    t2_secs      = new_dp.t2 > 0 ? new_dp.t2 : new_dp.valid_lt * 4 / 5;
+                    valid_secs   = new_dp.valid_lt;
+                    renew_time   = lease_start + std::chrono::seconds(t1_secs);
+                    rebind_time  = lease_start + std::chrono::seconds(t2_secs);
+                    expire_time  = lease_start + std::chrono::seconds(valid_secs);
+                    renew_sent   = false;
+                    rebind_sent  = false;
+                }
+            }
+
+            /* ---- T1 Renew ------------------------------------------- */
+            if (!renew_sent && now >= renew_time) {
+                dhcp->send_renew();
+                renew_sent = true;
+            }
+
+            /* ---- T2 Rebind ------------------------------------------ */
+            if (!rebind_sent && now >= rebind_time) {
+                dhcp->send_rebind();
+                rebind_sent = true;
+            }
+
+            /* ---- Lease expiry: re-solicit --------------------------- */
+            if (renew_sent && rebind_sent && now >= expire_time) {
+                LOG_WRN("WAN: lease expired without renewal reply – re-soliciting");
                 {
                     std::lock_guard<std::mutex> lk(shared.mtx);
-                    shared.dp = new_dp;
-                    if (changed) shared.generation++;
+                    shared.dp.valid = false;
+                    shared.generation++;
                 }
-                if (changed || new_dp.valid_lt != old_dp.valid_lt ||
-                    new_dp.preferred_lt != old_dp.preferred_lt) {
-                    notify_all_lans();
-                }
-
-                /* Reset renewal timers */
-                lease_start = now;
-                t1_secs = new_dp.t1 > 0 ? new_dp.t1 : new_dp.valid_lt / 2;
-                t2_secs = new_dp.t2 > 0 ? new_dp.t2 : new_dp.valid_lt * 4 / 5;
-                renew_time  = lease_start + std::chrono::seconds(t1_secs);
-                rebind_time = lease_start + std::chrono::seconds(t2_secs);
-                renew_sent  = false;
-                rebind_sent = false;
+                notify_all_lans();
+                break;  /* back to outer loop → obtain_prefix() */
             }
         }
 
-        /* ---- T1 Renew ----------------------------------------------- */
-        if (!renew_sent && now >= renew_time) {
-            dhcp->send_renew();
-            renew_sent = true;
-        }
-
-        /* ---- T2 Rebind ---------------------------------------------- */
-        if (!rebind_sent && now >= rebind_time) {
-            dhcp->send_rebind();
-            rebind_sent = true;
-        }
+        if (!g_running.load()) break;
+        /* lease_expired: loop back to obtain_prefix() */
     }
 
     /* ---- Release the lease ------------------------------------------ */
@@ -377,6 +408,7 @@ static void lan_thread_fn(const Config &cfg, const LanConfig &lcfg,
 
     LanState lan;
     uint64_t seen_gen = 0;
+    DelegatedPrefix last_dp{};  /* last dp we applied – used for health checks */
 
     using clock = std::chrono::steady_clock;
     auto next_ra = clock::now();
@@ -432,10 +464,19 @@ static void lan_thread_fn(const Config &cfg, const LanConfig &lcfg,
                 }
                 apply_lan(lcfg, cfg, lan, dp, *ra, shared);
                 seen_gen = gen;
+                last_dp  = dp;
+            } else if (!dp.valid && lan.configured) {
+                /* WAN lease expired – tear down until we get a new prefix */
+                LOG_WRN("LAN[%s] WAN prefix lost – tearing down",
+                        lcfg.interface.c_str());
+                teardown_lan(lcfg, lan, *ra, shared);
+                seen_gen = gen;
+                last_dp  = dp;
             } else if (dp.valid && lan.configured) {
                 /* Lifetime refresh only */
                 ra->set_prefix(lan.subnet, 64,
                                dp.valid_lt, dp.preferred_lt);
+                last_dp = dp;
             }
         }
 
@@ -446,6 +487,19 @@ static void lan_thread_fn(const Config &cfg, const LanConfig &lcfg,
 
         /* ---- Periodic RA -------------------------------------------- */
         if (now >= next_ra) {
+            /* Health check: re-apply address/route if kernel lost them */
+            if (lan.configured && last_dp.valid) {
+                if (!netconfig::has_address(lcfg.interface, lan.host_addr, 64)) {
+                    LOG_WRN("LAN[%s] host address missing – re-applying config",
+                            lcfg.interface.c_str());
+                    teardown_lan(lcfg, lan, *ra, shared);
+                    apply_lan(lcfg, cfg, lan, last_dp, *ra, shared);
+                } else if (!netconfig::has_route(lan.subnet, 64, lcfg.interface)) {
+                    LOG_WRN("LAN[%s] subnet route missing – re-adding",
+                            lcfg.interface.c_str());
+                    netconfig::add_route(lan.subnet, 64, lcfg.interface);
+                }
+            }
             ra->send_ra();
             next_ra = now + std::chrono::seconds(cfg.ra_interval);
         }

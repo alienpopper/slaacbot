@@ -19,14 +19,26 @@ namespace netconfig {
 /**
  * Run an external command, capture stdout+stderr.
  * Returns the exit status.  Output is stored in *output when non-null.
+ * When quiet=true the exec line is not logged (use for periodic health checks).
  */
 int  run_cmd(const std::vector<std::string> &args,
-             std::string *output = nullptr);
+             std::string *output = nullptr,
+             bool quiet = false);
 
 /* ---- interface information -------------------------------------------- */
 
 void get_mac(const std::string &iface, uint8_t mac[6]);
 int  get_ifindex(const std::string &iface);
+
+/* ---- address / route presence checks ---------------------------------- */
+
+/** Return true if iface currently has addr/prefix_len assigned. */
+bool has_address(const std::string &iface,
+                 const struct in6_addr &addr, int prefix_len);
+
+/** Return true if the kernel has a route for prefix/prefix_len via iface. */
+bool has_route(const struct in6_addr &prefix, int prefix_len,
+               const std::string &iface);
 
 /* ---- address / route management --------------------------------------- */
 

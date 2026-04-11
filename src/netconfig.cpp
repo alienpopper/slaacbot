@@ -23,11 +23,13 @@ namespace netconfig {
 /*  Command execution                                                    */
 /* ===================================================================== */
 
-int run_cmd(const std::vector<std::string> &args, std::string *output) {
+int run_cmd(const std::vector<std::string> &args, std::string *output,
+            bool quiet) {
     /* Build a debug string */
     std::string dbg;
     for (auto &a : args) { dbg += a; dbg += ' '; }
-    LOG_INF("exec: %s", dbg.c_str());
+    if (!quiet)
+        LOG_INF("exec: %s", dbg.c_str());
 
     int pipefd[2] = {-1, -1};
     if (output) {
@@ -135,6 +137,26 @@ void del_route(const struct in6_addr &prefix, int prefix_len,
     std::string r = to_string(prefix) + "/" + std::to_string(prefix_len);
     LOG_INF("route del %s dev %s", r.c_str(), iface.c_str());
     run_cmd({"ip", "-6", "route", "del", r, "dev", iface});
+}
+
+/* ===================================================================== */
+/*  Address / route presence checks                                      */
+/* ===================================================================== */
+
+bool has_address(const std::string &iface,
+                 const struct in6_addr &addr, int prefix_len) {
+    std::string a = to_string(addr) + "/" + std::to_string(prefix_len);
+    std::string out;
+    run_cmd({"ip", "-6", "addr", "show", "dev", iface}, &out, /*quiet=*/true);
+    return out.find(a) != std::string::npos;
+}
+
+bool has_route(const struct in6_addr &prefix, int prefix_len,
+               const std::string &iface) {
+    std::string r = to_string(prefix) + "/" + std::to_string(prefix_len);
+    std::string out;
+    run_cmd({"ip", "-6", "route", "show", "dev", iface}, &out, /*quiet=*/true);
+    return out.find(r) != std::string::npos;
 }
 
 /* ===================================================================== */
